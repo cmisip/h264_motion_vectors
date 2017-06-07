@@ -12,8 +12,10 @@
  */
 
 /*
- * Copyright (c) 2012 Stefano Sabatini
- * Copyright (c) 2014 Clément Bœsch
+ * Original Work Copyright (c) 2012 Stefano Sabatini
+ * Original Work Copyright (c) 2014 Clément Bœsch
+ * 
+ * Modified work Copyright 2017 Christopher Isip 
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -42,7 +44,6 @@ extern "C" {
 }
 
 #include <boost/circular_buffer.hpp>
-//#include <boost/thread.hpp>
 #include <iostream>
 
 #include <opencv2/imgproc/imgproc.hpp>
@@ -68,9 +69,8 @@ static AVFrame *frame = NULL;
 static int video_frame_count = 0;
 
 std::mutex cb_mutex;
-std::mutex vp_mutex;
-int motion_status=0;
 
+std::vector<cv::Point> coords;
 
 class ring_buffer{
 public:
@@ -146,6 +146,72 @@ uint8_t* buff=nullptr;
 AVPictureType Pict_type=AVPictureType::AV_PICTURE_TYPE_NONE;
 
 
+//from https://wrf.ecse.rpi.edu//Research/Short_Notes/pnpoly.html
+//int pnpoly(int nvert, float *vertx, float *verty, float testx, float testy)
+int pnpoly(int nvert, std::vector<cv::Point> vert, cv::Point p)
+{
+  int i, j, c = 0;
+  for (i = 0, j = nvert-1; i < nvert; j = i++) {
+    if ( ((vert[i].y>p.y) != (vert[j].y>p.y)) &&
+	 (p.x < (vert[j].x-vert[i].x) * (p.y-vert[i].y) / (vert[j].y-vert[i].y) + vert[i].x) )
+       c = !c;
+  }
+  return c;
+}
+
+bool polygon_complete=false;
+cv::Mat mRGB;
+void CallBackFunc(int event, int x, int y, int flags, void* userdata) {
+     if ( event == cv::EVENT_LBUTTONDBLCLK) //start polygon 
+     { 
+         std::cout << "POLYGON START" << std::endl;
+         coords.clear();
+         polygon_complete=false;
+         coords.push_back(cv::Point(x,y));
+     }   
+     
+     else if  ( event == cv::EVENT_LBUTTONDOWN ) //build polygon, end when point clicked is close to first point
+     {
+        if (!polygon_complete) { 
+         if (coords.size() <=2 ) {
+             if (coords.size()>0)
+               if ((abs(x-coords[0].x) > 5) || (abs(y-coords[0].y) > 5 )) {
+                  coords.push_back(cv::Point(x,y));
+               } 
+                   
+             
+         } 
+         else if (coords.size() > 2) {
+             if  ((abs(x-coords[0].x) < 5) && (abs(y-coords[0].y) < 5 ))  {
+                 polygon_complete=true;
+                 std::cout << "POLYGON COMPLETE" << std::endl;
+             } else {
+               coords.push_back(cv::Point(x,y));
+             }  
+         } 
+        } 
+         
+     }
+     
+     else if  ( event == cv::EVENT_RBUTTONDOWN ) //delete the last point
+     {    
+         if (!polygon_complete) { 
+             coords.pop_back();
+         }
+     }
+     
+     
+     else if  ( event == cv::EVENT_RBUTTONDBLCLK) //if coordinate within the polygon, delete the polygon
+     {
+         if (polygon_complete && (coords.size()>2))
+          if (pnpoly(coords.size(), coords, cv::Point(x,y) ) ) {
+             std::cout << "POLYGON DELETED" << std::endl;
+             coords.clear();
+             polygon_complete=false;
+          } 
+     }
+    
+}                                                              
 
 static void SaveFrame(AVFrame *pFrame, int width, int height, int iFrame)
 {
@@ -194,10 +260,9 @@ static int decode_packet(const AVPacket *pkt, std::vector<AVFrameSideData> *mvec
             return ret;
         }
         
-        
-        
-         
         if (ret >= 0) {
+            
+          if (frame->buf[0]) {  //REALLY IMPORTANT, otherwise bad frames sent to circular buffer results segfaults
             int i;
             AVFrameSideData *sd;
 
@@ -224,7 +289,9 @@ static int decode_packet(const AVPacket *pkt, std::vector<AVFrameSideData> *mvec
             
             if (ret<0)
                 return ret;
-            
+          } else
+              std::cout << "Invalid frame received" << std::endl;
+          
             av_frame_unref(frame);
         }
     }
@@ -275,8 +342,6 @@ static int open_codec_context(AVFormatContext *fmt_ctx, enum AVMediaType type)
         video_stream = fmt_ctx->streams[video_stream_idx];
         video_dec_ctx = dec_ctx;
         
-        
-        
     }
 
     return 0;
@@ -293,10 +358,9 @@ void streamocv(boost::circular_buffer<ring_buffer> &scb) {
     std::vector<AVFrameSideData> mbuff;
     std::vector<cv::Point> vert_points;
     
-    float power=2;
-    
     int min_vector_size=1; //FIXME, need to be a config option
     int min_vectors_motion=5; //FIXME, need to be a config option
+    
     int vec_count=0;
     //LOOP
     while (scb_size > 0 ) {
@@ -318,19 +382,17 @@ void streamocv(boost::circular_buffer<ring_buffer> &scb) {
                std::vector<AVMotionVector> mvlistv=std::vector<AVMotionVector>(mv,mv+mvcount);
             
                vec_count=0;
-               motion_status=0;
                for (auto mv : mvlistv) {
-              /* printf("%2d,%2d,%2d,%4d,%4d,%4d,%4d,0x%" PRIx64 "\n",
-                        mv.source,
-                        mv.w, mv.h, mv.src_x, mv.src_y,
-                        mv.dst_x, mv.dst_y, mv.flags);*/
-                   
+              
                   //Check if different source and dest 
                   if ((mv.src_x == mv.dst_x) && (mv.src_y == mv.dst_y))
                       continue;
                   
                   //Check if vector had significant value
-                  int magnitude=(int) sqrt (  std::pow( (mv.dst_x-mv.src_x) ,power) + std::pow( (mv.dst_y-mv.src_y) ,power)   )  ;
+                  //float power=2;
+                  //int magnitude=(int) sqrt (  std::pow( (mv.dst_x-mv.src_x) ,power) + std::pow( (mv.dst_y-mv.src_y) ,power)   )  ;
+                  //Use manhattan distance to avoid expensive sqrt and pow functions
+                  int magnitude = abs(mv.dst_x-mv.src_x) + abs(mv.dst_y-mv.src_y);
                   if (magnitude < min_vector_size)
                       continue;
                   
@@ -338,20 +400,37 @@ void streamocv(boost::circular_buffer<ring_buffer> &scb) {
                   vert_points.push_back(cv::Point(mv.dst_x,mv.dst_y));
                 
                } 
-               //std::cout << "VECTORS passed " << vec_count  << " " << mvcount << std::endl;
             }
             
            cv::Mat mYUV(dec_ctx->height + dec_ctx->height/2, dec_ctx->width, CV_8UC1, (void*) rbuff);
-           cv::Mat mRGB(dec_ctx->height, dec_ctx->width, CV_8UC3);
            cv::cvtColor(mYUV, mRGB, CV_YUV2RGB_YV12,3); 
-        
+           if (!polygon_complete){
+               if (coords.size() == 0) {
+                 cv::putText(mRGB, "Double Left CLick to Start Polygon inclusion zone", cv::Point(100,100), cv::FONT_HERSHEY_PLAIN, 1,  cv::Scalar(0,0,255,255));
+               } else {
+                 for (int i=0; i<coords.size() ; i++  ) {
+                   cv::circle( mRGB, coords[i], 5.0, cv::Scalar( 0, 255, 0 ), 5, 8 ); 
+                   cv::putText(mRGB, "Single Left CLick to add polygon vertex, close by clicking first vertex", cv::Point(100,100), cv::FONT_HERSHEY_PLAIN, 1,  cv::Scalar(0,0,255,255));
+                 }
+               }    
+           } else { 
+               cv::putText(mRGB, "Double Right CLick inside polygon to delete Polygon", cv::Point(100,100), cv::FONT_HERSHEY_PLAIN, 1,  cv::Scalar(0,0,255,255));
+               if (coords.size()>2)
+                   cv::polylines(mRGB, coords, true, cv::Scalar( 110, 220, 0 ),  2, 8);
+                   
+           }
+         
+          
            if (vert_points.size() > 0) {
                   for (auto j: vert_points) {
-                     cv::circle( mRGB, j, 5.0, cv::Scalar( 0, 0, 255 ), 5, 8 );  
+                    if (polygon_complete) {  
+                      if (pnpoly(coords.size(), coords, j))
+                        cv::circle( mRGB, j, 5.0, cv::Scalar( 0, 0, 255 ), 5, 8 );
+                    }
                   }
                   vert_points.clear();
            }
-           cv::imshow("press ESC to exit", mRGB);
+           cv::imshow("Video", mRGB);
            cv::waitKey(1);
            
            free(rbuff); //we owned this, so we need to free it
@@ -366,19 +445,9 @@ void streamocv(boost::circular_buffer<ring_buffer> &scb) {
     
 }
 
-//from https://wrf.ecse.rpi.edu//Research/Short_Notes/pnpoly.html
-/*int pnpoly(int nvert, float *vertx, float *verty, float testx, float testy)
-{
-  int i, j, c = 0;
-  for (i = 0, j = nvert-1; i < nvert; j = i++) {
-    if ( ((verty[i]>testy) != (verty[j]>testy)) &&
-	 (testx < (vertx[j]-vertx[i]) * (testy-verty[i]) / (verty[j]-verty[i]) + vertx[i]) )
-       c = !c;
-  }
-  return c;
-}*/
 
-void analyze(boost::circular_buffer<ring_buffer> &acb, int &motion_status, std::vector<cv::Point> &vert_points) {
+
+/*void analyze(boost::circular_buffer<ring_buffer> &acb, int &motion_status, std::vector<cv::Point> &vert_points) {
     //Find the first scb not analyzed yet
     usleep(5000000);
     int acb_size=1;
@@ -413,10 +482,10 @@ void analyze(boost::circular_buffer<ring_buffer> &acb, int &motion_status, std::
                vec_count=0;
                motion_status=0;
                for (auto mv : mvlistv) {
-              /* printf("%2d,%2d,%2d,%4d,%4d,%4d,%4d,0x%" PRIx64 "\n",
-                        mv.source,
-                        mv.w, mv.h, mv.src_x, mv.src_y,
-                        mv.dst_x, mv.dst_y, mv.flags);*/
+              // printf("%2d,%2d,%2d,%4d,%4d,%4d,%4d,0x%" PRIx64 "\n",
+              //          mv.source,
+              //          mv.w, mv.h, mv.src_x, mv.src_y,
+              //          mv.dst_x, mv.dst_y, mv.flags);
                    
                   //Check if different source and dest 
                   if ((mv.src_x == mv.dst_x) && (mv.src_y == mv.dst_y))
@@ -441,7 +510,7 @@ void analyze(boost::circular_buffer<ring_buffer> &acb, int &motion_status, std::
         acb_size=1;
     }
 }
-    
+ */   
     
     
 
@@ -471,7 +540,11 @@ int main(int argc, char **argv)
     }
 
     open_codec_context(fmt_ctx, AVMEDIA_TYPE_VIDEO);
-
+    
+    cv::namedWindow("Video", 1);
+    cv::setMouseCallback("Video", CallBackFunc, NULL);
+    mRGB=cv::Mat(dec_ctx->height, dec_ctx->width, CV_8UC3);
+    
     av_dump_format(fmt_ctx, 0, src_filename, 0);
 
     if (!video_stream) {
@@ -486,10 +559,6 @@ int main(int argc, char **argv)
         ret = AVERROR(ENOMEM);
         goto end;
     }
-    
-    
-    
-    
  
     {
     //Launch the streaming thread
@@ -506,8 +575,6 @@ int main(int argc, char **argv)
                   std::lock_guard<std::mutex> lock(cb_mutex);
                   cb.push_back(ring_buffer(mvects,buff,Pict_type));
                 }  
-                
-            
         }    
         av_packet_unref(&pkt);
         if (ret < 0)
@@ -520,10 +587,6 @@ int main(int argc, char **argv)
     t_stream.join();
     }
     
-    
-    
-    
-        
     
     /* flush cached frames */
     //decode_packet(NULL,NULL);
