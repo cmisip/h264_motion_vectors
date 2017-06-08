@@ -74,26 +74,26 @@ std::vector<cv::Point> coords;
 
 class ring_buffer{
 public:
-    std::vector <AVFrameSideData> mv_data;
-    uint8_t* buf_data;
+    uint8_t * mv_data;
+    uint8_t * buf_data;
     int f_state=2;  //2=not analyzed yet, 1=motion in frame, 0=no motion in frame
     
     AVPictureType pict_type=AVPictureType::AV_PICTURE_TYPE_NONE;
     
-    ring_buffer(std::vector <AVFrameSideData> imv_data, uint8_t* ibuf_data): mv_data(imv_data), buf_data(ibuf_data) { 
+    ring_buffer(uint8_t * imv_data, uint8_t* ibuf_data): mv_data(imv_data), buf_data(ibuf_data) { 
         f_state=2;
         pict_type=AVPictureType::AV_PICTURE_TYPE_NONE;
     }
     
-    ring_buffer(std::vector <AVFrameSideData> imv_data, uint8_t* ibuf_data, int if_state): mv_data(imv_data), buf_data(ibuf_data), f_state(if_state) { 
+    ring_buffer(uint8_t * imv_data, uint8_t* ibuf_data, int if_state): mv_data(imv_data), buf_data(ibuf_data), f_state(if_state) { 
         pict_type= AVPictureType::AV_PICTURE_TYPE_NONE;
     }
     
-    ring_buffer(std::vector <AVFrameSideData> imv_data, uint8_t* ibuf_data, AVPictureType i_pict_type) : mv_data(imv_data), buf_data(ibuf_data), pict_type(i_pict_type) { 
+    ring_buffer(uint8_t * imv_data, uint8_t* ibuf_data, AVPictureType i_pict_type) : mv_data(imv_data), buf_data(ibuf_data), pict_type(i_pict_type) { 
     }
     
     ring_buffer() {
-        mv_data={};
+        mv_data=nullptr;
         buf_data=nullptr;
     }
     
@@ -103,6 +103,7 @@ public:
         buf_data=other.buf_data;
         other.buf_data=nullptr;
         mv_data=other.mv_data;
+        other.mv_data=nullptr;
         pict_type=other.pict_type;
         f_state=other.f_state;
         
@@ -115,9 +116,13 @@ public:
         if (this!=&other) {
           if (buf_data)
                 free(buf_data);
+          if (mv_data)
+                free(mv_data);
+          
           buf_data=other.buf_data;
           other.buf_data=nullptr;
           mv_data=other.mv_data;
+          other.mv_data=nullptr;
           pict_type=other.pict_type;
           f_state=other.f_state;
         }
@@ -137,12 +142,19 @@ public:
             free(buf_data);
             buf_data=nullptr;
         }
+        if (mv_data) {
+            free(mv_data);
+            mv_data=nullptr;
+        }
     }
 };
+
+
 // Create a circular buffer with a capacity for 10 ring_buffer.
 boost::circular_buffer<ring_buffer > cb(40);
-std::vector<AVFrameSideData> mvects;
-uint8_t* buff=nullptr;
+//std::vector<AVFrameSideData> mvects;
+uint8_t * mvects=nullptr;
+uint8_t * buff=nullptr;
 AVPictureType Pict_type=AVPictureType::AV_PICTURE_TYPE_NONE;
 
 
@@ -237,7 +249,7 @@ static void SaveFrame(AVFrame *pFrame, int width, int height, int iFrame)
     fclose(pFile);
 }
 
-static int decode_packet(const AVPacket *pkt, std::vector<AVFrameSideData> *mvect, uint8_t **buffer, AVPictureType &Pict_type)
+static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **buffer, AVPictureType &Pict_type)
 {
     //if (video_frame_count > 10)
     //        return -1;
@@ -269,9 +281,13 @@ static int decode_packet(const AVPacket *pkt, std::vector<AVFrameSideData> *mvec
             //video_frame_count++;
             sd = av_frame_get_side_data(frame, AV_FRAME_DATA_MOTION_VECTORS);
             if (sd) {
-                *mvect = std::vector<AVFrameSideData>(sd,sd+1);
-            } else
-                mvect={};
+                *mvect = (uint8_t *) av_malloc(sizeof(AVFrameSideData));
+                memcpy(*mvect,sd,sizeof(AVFrameSideData));
+                //std::cout << memcmp(*mvect,sd,sizeof(AVFrameSideData)) << std::endl;
+                
+            }
+             else
+                *mvect=nullptr;
   
             //Save the pict type
             Pict_type=frame->pict_type;
@@ -279,6 +295,7 @@ static int decode_packet(const AVPacket *pkt, std::vector<AVFrameSideData> *mvec
             //SAVE the frame buffer to buffer in its default pixelformat
             int bufsize=av_image_get_buffer_size(AV_PIX_FMT_YUV420P, frame->width, frame->height, 1);
             *buffer = (uint8_t *) av_malloc(bufsize);
+            memset(*buffer,0,bufsize);
             if (*buffer)
               ret=av_image_copy_to_buffer(*buffer, bufsize, (const uint8_t **)frame->data, frame->linesize,
                                 AV_PIX_FMT_YUV420P, frame->width, frame->height, 1);
@@ -348,14 +365,13 @@ static int open_codec_context(AVFormatContext *fmt_ctx, enum AVMediaType type)
 }
 
 
-
 void streamocv(boost::circular_buffer<ring_buffer> &scb) {
     //USES less memory but no scaling
     int scb_size=1;
-    usleep(5000000); //Let's wait for scb to populate
+    usleep(3000000); //Let's wait for scb to populate
     
     uint8_t *rbuff=nullptr;
-    std::vector<AVFrameSideData> mbuff;
+    AVFrameSideData* mbuff;
     std::vector<cv::Point> vert_points;
     
     int min_vector_size=1; //FIXME, need to be a config option
@@ -367,21 +383,23 @@ void streamocv(boost::circular_buffer<ring_buffer> &scb) {
         { //scope the lock_guard  
          std::lock_guard<std::mutex> lock(cb_mutex);
          scb_size=scb.size();
-         if (scb[0].buf_data) {
+         if ((scb[0].buf_data) && (scb[0].mv_data)) {
            rbuff=scb[0].buf_data; //avoid a race condition, scb[0] might get updated by main thread while we are processing buf_data
            scb[0].buf_data=nullptr; // so take ownership
-           mbuff=std::move(scb[0].mv_data);
+           mbuff=(AVFrameSideData *)scb[0].mv_data;
+           scb[0].mv_data=nullptr;
+          
          }
         } //end scope
-    
-        if ((mbuff.size() > 0) && (rbuff)){
+        
+        if ((mbuff->data) && (rbuff)){
             int mvcount;
-            for (auto k : mbuff) { //FIXME, there is probably always one element
-               AVMotionVector *mv = (AVMotionVector*)k.data;
-               mvcount = k.size / sizeof(AVMotionVector);
+               AVMotionVector *mv = (AVMotionVector*)mbuff->data;
+               mvcount = mbuff->size / sizeof(AVMotionVector);
                std::vector<AVMotionVector> mvlistv=std::vector<AVMotionVector>(mv,mv+mvcount);
             
                vec_count=0;
+               if (mvlistv.size() > 0) {
                for (auto mv : mvlistv) {
               
                   //Check if different source and dest 
@@ -399,8 +417,8 @@ void streamocv(boost::circular_buffer<ring_buffer> &scb) {
                   vec_count++; 
                   vert_points.push_back(cv::Point(mv.dst_x,mv.dst_y));
                 
-               } 
-            }
+               }
+               }
             
            cv::Mat mYUV(dec_ctx->height + dec_ctx->height/2, dec_ctx->width, CV_8UC1, (void*) rbuff);
            cv::cvtColor(mYUV, mRGB, CV_YUV2RGB_YV12,3); 
@@ -423,8 +441,9 @@ void streamocv(boost::circular_buffer<ring_buffer> &scb) {
           
            if (vert_points.size() > 0) {
                   for (auto j: vert_points) {
-                    if (polygon_complete) {  
-                      if (pnpoly(coords.size(), coords, j))
+                    if (polygon_complete) {  //polygon zone established
+                      if (pnpoly(coords.size(), coords, j)) //vector is inside the zone
+                            
                         cv::circle( mRGB, j, 5.0, cv::Scalar( 0, 0, 255 ), 5, 8 );
                     }
                   }
@@ -437,10 +456,6 @@ void streamocv(boost::circular_buffer<ring_buffer> &scb) {
            rbuff=nullptr;
             
         } 
-        
-      
-      
-        
     }
     
 }
