@@ -374,8 +374,12 @@ void streamocv(boost::circular_buffer<ring_buffer> &scb) {
     AVFrameSideData* mbuff;
     std::vector<cv::Point> vert_points;
     
+    //minimum manhattan distance to consider a motion_vector with displacement
     int min_vector_size=1; //FIXME, need to be a config option
-    int min_vectors_motion=5; //FIXME, need to be a config option
+    //number of vectors clustered together as minimum "filter"
+    int min_vectors_filter=2; //FIXME, need to be a config option
+    //minimum manhattan pixel distance between vectors to consider them as belonging together in a cluster
+    int min_vector_cluster_distance=10;  //FIXME, need to be a config option
     
     int vec_count=0;
     //LOOP
@@ -442,9 +446,11 @@ void streamocv(boost::circular_buffer<ring_buffer> &scb) {
            if (vert_points.size() > 0) {
                   for (auto j: vert_points) {
                     if (polygon_complete) {  //polygon zone established
-                      if (pnpoly(coords.size(), coords, j)) //vector is inside the zone
-                            
-                        cv::circle( mRGB, j, 5.0, cv::Scalar( 0, 0, 255 ), 5, 8 );
+                      if (pnpoly(coords.size(), coords, j)) {//vector is inside the zone
+                           auto it = std::partition(vert_points.begin(), vert_points.end(), [j,min_vector_cluster_distance](cv::Point i){ return ( (abs(j.x - i.x) + abs(j.y -i.y)) < min_vector_cluster_distance ); });
+                           if ((it-vert_points.begin()) > min_vectors_filter) //vector is close to other vectors
+                             cv::circle( mRGB, j, 5.0, cv::Scalar( 0, 0, 255 ), 5, 8 );
+                      }  
                     }
                   }
                   vert_points.clear();
