@@ -249,30 +249,32 @@ static void SaveFrame(AVFrame *pFrame, int width, int height, int iFrame)
     fclose(pFile);
 }
 
-static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **buffer, AVPictureType &Pict_type)
-{
+static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **buffer, AVPictureType &Pict_type) {
     //if (video_frame_count > 10)
     //        return -1;
     //std::cout << "FRAME " << video_frame_count++ << std::endl;
     
-    
+    int framecomplete=false;
     //Start decode here
-    int ret = avcodec_send_packet(video_dec_ctx, pkt);
-    if (ret < 0) {
-        std::cout << "Error sending packet " << std::endl;
-        return ret;
-    }
+    while (!framecomplete) {
+        int ret = avcodec_send_packet(video_dec_ctx, pkt);
+        if (ret < 0) {
+            std::cout << "Error sending packet " << std::endl;
+            continue;
+        }
     
-    while (ret >= 0)  {
         ret = avcodec_receive_frame(video_dec_ctx, frame);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-            break;
-        } else if (ret < 0) {
+             continue;
+        } 
+        if (ret<0) {
             std::cout << "Error receiving packet" << std::endl;
-            return ret;
+            continue;
         }
+    framecomplete=true;
+    }    
         
-        if (ret >= 0) {
+        if (framecomplete) {
             
           if (frame->buf[0]) {  //REALLY IMPORTANT, otherwise bad frames sent to circular buffer results segfaults
             int i;
@@ -281,7 +283,7 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **buffer,
             //video_frame_count++;
             sd = av_frame_get_side_data(frame, AV_FRAME_DATA_MOTION_VECTORS);
             if (sd) {
-                *mvect = (uint8_t *) av_malloc(sizeof(AVFrameSideData));
+                *mvect = (uint8_t *) malloc(sizeof(AVFrameSideData));
                 memcpy(*mvect,sd,sizeof(AVFrameSideData));
                 //std::cout << memcmp(*mvect,sd,sizeof(AVFrameSideData)) << std::endl;
                 
@@ -294,8 +296,9 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **buffer,
             
             //SAVE the frame buffer to buffer in its default pixelformat
             int bufsize=av_image_get_buffer_size(AV_PIX_FMT_YUV420P, frame->width, frame->height, 1);
-            *buffer = (uint8_t *) av_malloc(bufsize);
+            *buffer = (uint8_t *) malloc(bufsize);
             memset(*buffer,0,bufsize);
+            int ret;
             if (*buffer)
               ret=av_image_copy_to_buffer(*buffer, bufsize, (const uint8_t **)frame->data, frame->linesize,
                                 AV_PIX_FMT_YUV420P, frame->width, frame->height, 1);
@@ -311,10 +314,10 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **buffer,
           
             av_frame_unref(frame);
         }
+    return 0;
     }
 
-    return 0;
-}
+
 
 static int open_codec_context(AVFormatContext *fmt_ctx, enum AVMediaType type)
 {
@@ -367,9 +370,9 @@ static int open_codec_context(AVFormatContext *fmt_ctx, enum AVMediaType type)
 
 void streamocv(boost::circular_buffer<ring_buffer> &scb) {
     //USES less memory but no scaling
-    int scb_size=1;
-    usleep(3000000); //Let's wait for scb to populate
     
+    usleep(5000000); //Let's wait for scb to populate
+    int scb_size=scb.size();
     uint8_t *rbuff=nullptr;
     AVFrameSideData* mbuff;
     std::vector<cv::Point> vert_points;
@@ -594,7 +597,8 @@ int main(int argc, char **argv)
             if (ret >= 0)
                 {
                   std::lock_guard<std::mutex> lock(cb_mutex);
-                  cb.push_back(ring_buffer(mvects,buff,Pict_type));
+                  if ((mvects) && (buff))  //only push if we have valid buffers
+                    cb.push_back(ring_buffer(mvects,buff,Pict_type));
                 }  
         }    
         av_packet_unref(&pkt);
