@@ -71,6 +71,7 @@ static int video_frame_count = 0;
 std::mutex cb_mutex;
 
 std::vector<cv::Point> coords;
+bool quitkey=false;
 
 class ring_buffer{
 public:
@@ -221,6 +222,10 @@ void CallBackFunc(int event, int x, int y, int flags, void* userdata) {
              coords.clear();
              polygon_complete=false;
           } 
+     }
+     else if  ( event == cv::EVENT_MBUTTONDBLCLK) //if coordinate within the polygon, delete the polygon
+     {   quitkey=true;
+     
      }
     
 }                                                              
@@ -461,10 +466,16 @@ void streamocv(boost::circular_buffer<ring_buffer> &scb) {
            cv::imshow("Video", mRGB);
            cv::waitKey(1);
            
+           
+           
            free(rbuff); //we owned this, so we need to free it
            rbuff=nullptr;
             
-        } 
+        }
+        if (quitkey) {
+            std::cout << "Quit" << std::endl;
+               break;
+        }       
     }
     
 }
@@ -589,7 +600,7 @@ int main(int argc, char **argv)
     std::thread t_stream(streamocv, std::ref(cb));    
    
     
-    while (true) {
+    //while (true) {
     /* read frames from the file */
     while (av_read_frame(fmt_ctx, &pkt) >= 0) {
         if (pkt.stream_index == video_stream_idx) {
@@ -604,8 +615,10 @@ int main(int argc, char **argv)
         av_packet_unref(&pkt);
         if (ret < 0)
             break;
+        if (quitkey)
+            break;
     }
-    }
+    //}
     
     
    //join the streaming thread 
