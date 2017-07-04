@@ -627,8 +627,7 @@ int main(int argc, char **argv)
     
     
     /* flush cached frames */
-    //decode_packet(NULL,NULL);
-
+    avcodec_flush_buffers(dec_ctx);
 end:
     avcodec_free_context(&video_dec_ctx);
     avformat_close_input(&fmt_ctx);
