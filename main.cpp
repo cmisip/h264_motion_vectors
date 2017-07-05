@@ -41,6 +41,9 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavformat/avformat.h>
 #include "libswscale/swscale.h"
+#include "interface/mmal/mmal.h"
+#include "interface/mmal/util/mmal_default_components.h"
+#include "interface/vcos/vcos.h"
 }
 
 #include <boost/circular_buffer.hpp>
@@ -61,6 +64,7 @@ static AVFormatContext *fmt_ctx = NULL;
 static AVCodecContext *video_dec_ctx = NULL;
 static AVStream *video_stream = NULL;
 static const char *src_filename = NULL;
+static const char *src_codec = NULL;
 AVCodecContext *dec_ctx = NULL;
 AVCodec *dec = NULL;
 
@@ -72,6 +76,48 @@ std::mutex cb_mutex;
 
 std::vector<cv::Point> coords;
 bool quitkey=false;
+
+enum decode_options {
+    x264,
+    mmal
+} decode_mode;
+
+struct motion_vector {
+    char x_vector;
+    char y_vector;
+    uint16_t xcoord;  //location of top left corner
+    uint16_t ycoord;
+    uint8_t width;    //dimensions of macroblock
+    uint8_t height;
+    unsigned short sad;
+};
+
+struct motion_vector_group {
+    std::vector<motion_vector> mvect;
+    uint16_t size;
+};
+
+
+
+/** mmal context */
+static struct CONTEXT_T {
+   VCOS_SEMAPHORE_T semaphore;
+   MMAL_QUEUE_T *queue;
+} context;
+
+
+static void input_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer) {
+   struct CONTEXT_T *ctx = (struct CONTEXT_T *)port->userdata;
+   mmal_buffer_header_release(buffer);
+   vcos_semaphore_post(&ctx->semaphore);
+}
+
+static void output_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer) {
+   struct CONTEXT_T *ctx = (struct CONTEXT_T *)port->userdata;
+   mmal_queue_put(ctx->queue, buffer);
+   vcos_semaphore_post(&ctx->semaphore);
+}
+
 
 class ring_buffer{
 public:
@@ -238,18 +284,35 @@ static void SaveFrame(AVFrame *pFrame, int width, int height, int iFrame)
 
     // Open file
     sprintf(szFilename, "frame%d.ppm", iFrame);
-	printf("Open File: frame%d.ppm\n", iFrame);
+    printf("Open File: frame%d.ppm\n", iFrame);
     pFile=fopen(szFilename, "wb");
     if(pFile==NULL)
         return;
 
+    /*RGB
     // Write header
     fprintf(pFile, "P6\n%d %d\n255\n", width, height);
 
     // Write pixel data
     for(y=0; y<height; y++)
         fwrite(pFrame->data[0]+y*pFrame->linesize[0], 1, width*3, pFile);
+    */
     
+    //YUV420
+    fprintf(pFile, "P5\n%d %d\n255\n", width, height); //P5 is grayscale, need to convert to RGB24 and use P6 to get color
+    for (y = 0; y < height; y++)
+    {
+      fwrite(pFrame->data[0] + y*pFrame->linesize[0], 1, width, pFile);
+    }
+
+    for (y = 0; y < height / 2; y++)
+    {
+    fwrite(pFrame->data[1] + y*pFrame->linesize[1], 1, width / 2, pFile);
+    fwrite(pFrame->data[2] + y*pFrame->linesize[2], 1, width / 2, pFile);
+    }
+   
+    printf("Done writing");
+
     // Close file
     fclose(pFile);
 }
@@ -260,9 +323,10 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **buffer,
     //std::cout << "FRAME " << video_frame_count++ << std::endl;
     
     int framecomplete=false;
+    int ret;
     //Start decode here
     while (!framecomplete) {
-        int ret = avcodec_send_packet(video_dec_ctx, pkt);
+        ret = avcodec_send_packet(video_dec_ctx, pkt);
         if (ret < 0) {
             std::cout << "Error sending packet " << std::endl;
             continue;
@@ -279,7 +343,8 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **buffer,
     framecomplete=true;
     }    
         
-        if (framecomplete) {
+    if (framecomplete) {
+        if (decode_mode == x264) {
             
           if (frame->buf[0]) {  //REALLY IMPORTANT, otherwise bad frames sent to circular buffer results segfaults
             int i;
@@ -288,10 +353,44 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **buffer,
             //video_frame_count++;
             sd = av_frame_get_side_data(frame, AV_FRAME_DATA_MOTION_VECTORS);
             if (sd) {
-                *mvect = (uint8_t *) malloc(sizeof(AVFrameSideData));
-                memcpy(*mvect,sd,sizeof(AVFrameSideData));
-                //std::cout << memcmp(*mvect,sd,sizeof(AVFrameSideData)) << std::endl;
                 
+                motion_vector_group mgroup;
+                mgroup.size=sd->size / sizeof(AVMotionVector);
+                const AVMotionVector *mvs = (const AVMotionVector *)sd->data;
+                    for (i = 0; i < sd->size / sizeof(*mvs); i++) {
+                        const AVMotionVector *mv = &mvs[i];
+                        motion_vector mvt;
+                        mvt.height = mv->h;
+                        mvt.width = mv->w;
+                        mvt.xcoord = mv->dst_x;
+                        mvt.ycoord = mv->dst_y;
+                        mvt.sad = 0;
+                        mvt.x_vector = mv->src_x - mv->dst_x;
+                        mvt.y_vector = mv->src_y - mv->dst_y;
+                        
+                        //Exclude motion vectors with zero x_vector and y_vector (did not move)
+                        if ((mvt.x_vector == 0) && (mvt.y_vector == 0))
+                            continue;
+                        
+                        //Exclude motion vectors that are outside the frame
+                        if (mvt.xcoord < 0)
+                            continue;
+                        
+                        if (mvt.ycoord < 0)
+                            continue;
+                        
+                        if (mvt.xcoord > video_dec_ctx->width)
+                            continue;
+                        
+                        if (mvt.ycoord > video_dec_ctx->height)
+                            continue;
+                        
+                        
+                        mgroup.mvect.push_back(mvt);
+                    }
+                 *mvect = (uint8_t *) malloc(sizeof(mgroup));
+                 memcpy(*mvect,&mgroup,sizeof(mgroup));
+                 
             }
              else
                 *mvect=nullptr;
@@ -318,10 +417,14 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **buffer,
               std::cout << "Invalid frame received" << std::endl;
           
             av_frame_unref(frame);
+        } //if x264
+        
+        if (decode_mode == mmal) {
+            printf("MMAL");
         }
+    }    //if framecomplete
     return 0;
     }
-
 
 
 static int open_codec_context(AVFormatContext *fmt_ctx, enum AVMediaType type)
@@ -331,8 +434,8 @@ static int open_codec_context(AVFormatContext *fmt_ctx, enum AVMediaType type)
     
     AVDictionary *opts = NULL;
 
-    ret = av_find_best_stream(fmt_ctx, type, -1, -1, &dec, 0);  //1 this version creates dec
-    //ret = av_find_best_stream(fmt_ctx, type, -1, -1, NULL, 0); //2 this version requires avcodec_find_decoder
+    //ret = av_find_best_stream(fmt_ctx, type, -1, -1, &dec, 0);  //1 this version creates dec
+    ret = av_find_best_stream(fmt_ctx, type, -1, -1, NULL, 0); //2 this version requires avcodec_find_decoder
     
     if (ret < 0) {
         fprintf(stderr, "Could not find %s stream in input file '%s'\n",
@@ -341,9 +444,11 @@ static int open_codec_context(AVFormatContext *fmt_ctx, enum AVMediaType type)
     } else {
         int stream_idx = ret;
         st = fmt_ctx->streams[stream_idx];
+        
         //dec = avcodec_find_decoder(st->codecpar->codec_id); //2 
         
-        dec_ctx = avcodec_alloc_context3(dec);
+        //dec_ctx = avcodec_alloc_context3(dec);
+        dec_ctx = avcodec_alloc_context3(NULL);
         if (!dec_ctx) {
             fprintf(stderr, "Failed to allocate codec\n");
             return AVERROR(EINVAL);
@@ -357,7 +462,21 @@ static int open_codec_context(AVFormatContext *fmt_ctx, enum AVMediaType type)
         dec_ctx->pix_fmt=AV_PIX_FMT_YUV420P;
 
         /* Init the video decoder */
-        av_dict_set(&opts, "flags2", "+export_mvs", 0);
+        if (strcmp(src_codec, "x264") == 0) {
+            decode_mode=::decode_options::x264;
+          if ((dec = avcodec_find_decoder(st->codecpar->codec_id)) == NULL) {
+              fprintf(stderr, "Failed to find hardware codec mmal");
+              return ret;
+          }    
+          av_dict_set(&opts, "flags2", "+export_mvs", 0);
+        }
+        if (strcmp(src_codec, "mmal") == 0) { 
+            decode_mode=::decode_options::mmal;
+          if ( (dec = avcodec_find_decoder_by_name("h264_mmal")) == NULL )  {
+              fprintf(stderr, "Failed to find hardware codec mmal");    
+              return ret;
+          }
+        }
         if ((ret = avcodec_open2(dec_ctx, dec, &opts)) < 0) {
             fprintf(stderr, "Failed to open %s codec\n", av_get_media_type_string(type));
             return ret;
@@ -366,21 +485,118 @@ static int open_codec_context(AVFormatContext *fmt_ctx, enum AVMediaType type)
         video_stream_idx = stream_idx;
         video_stream = fmt_ctx->streams[video_stream_idx];
         video_dec_ctx = dec_ctx;
-        
     }
 
     return 0;
 }
 
+static int open_mmal_context(AVCodecContext *video_dec_ctx){  //video_dec_ctx is global, just reminds that this depends on open_codec_context
+   MMAL_COMPONENT_T *encoder = 0;
+   MMAL_POOL_T *pool_in = 0, *pool_out = 0;
+   
 
+   vcos_semaphore_create(&context.semaphore, "example", 1);
+
+   // Create the encoder component.
+   if ( mmal_component_create(MMAL_COMPONENT_DEFAULT_VIDEO_ENCODER, &encoder)  != MMAL_SUCCESS) 
+      fprintf(stderr,"failed to create mmal encoder");
+
+   /* Set format of video encoder input port */
+   MMAL_ES_FORMAT_T *format_in = encoder->input[0]->format;
+   format_in->type = MMAL_ES_TYPE_VIDEO;
+   format_in->encoding = MMAL_ENCODING_I420;
+   format_in->es->video.width = video_dec_ctx->width;
+   format_in->es->video.height = video_dec_ctx->height;
+   format_in->es->video.frame_rate.num = 30;
+   format_in->es->video.frame_rate.den = 1;
+   format_in->es->video.par.num = 1;
+   format_in->es->video.par.den = 1;
+   format_in->es->video.crop.width = video_dec_ctx->width;
+   format_in->es->video.crop.height = video_dec_ctx->height;
+ 
+
+   if ( mmal_port_format_commit(encoder->input[0]) != MMAL_SUCCESS )
+      fprintf(stderr, "failed to commit mmal encoder input format");
+
+   MMAL_ES_FORMAT_T *format_out = encoder->output[0]->format;
+   format_out->type = MMAL_ES_TYPE_VIDEO;
+   format_out->encoding = MMAL_ENCODING_H264;
+   format_out->es->video.width = video_dec_ctx->width;
+   format_out->es->video.height = video_dec_ctx->height;
+   format_out->es->video.frame_rate.num = 30;
+   format_out->es->video.frame_rate.den = 1;
+   format_out->es->video.par.num = 0; 
+   format_out->es->video.par.den = 1;
+   
+   
+   if ( mmal_port_format_commit(encoder->output[0]) != MMAL_SUCCESS )
+     fprintf(stderr, "failed to commit output format");
+
+   /* Display the input port format */
+   fprintf(stderr, "INPUT FORMAT \n");
+   fprintf(stderr, "%s\n", encoder->input[0]->name);
+   fprintf(stderr, " type: %i, fourcc: %4.4s\n", format_in->type, (char *)&format_in->encoding);
+   fprintf(stderr, " bitrate: %i, framed: %i\n", format_in->bitrate,
+           !!(format_in->flags & MMAL_ES_FORMAT_FLAG_FRAMED));
+   fprintf(stderr, " extra data: %i, %p\n", format_in->extradata_size, format_in->extradata);
+   fprintf(stderr, " width: %i, height: %i, (%i,%i,%i,%i)\n",
+           format_in->es->video.width, format_in->es->video.height,
+           format_in->es->video.crop.x, format_in->es->video.crop.y,
+           format_in->es->video.crop.width, format_in->es->video.crop.height);
+
+   /* Display the output port format */
+   fprintf(stderr, "OUTPUT FORMAT \n");
+   fprintf(stderr, "%s\n", encoder->output[0]->name);
+   fprintf(stderr, " type: %i, fourcc: %4.4s\n", format_out->type, (char *)&format_out->encoding);
+   fprintf(stderr, " bitrate: %i, framed: %i\n", format_out->bitrate,
+           !!(format_out->flags & MMAL_ES_FORMAT_FLAG_FRAMED));
+   fprintf(stderr, " extra data: %i, %p\n", format_out->extradata_size, format_out->extradata);
+   fprintf(stderr, " width: %i, height: %i, (%i,%i,%i,%i)\n",
+           format_out->es->video.width, format_out->es->video.height,
+           format_out->es->video.crop.x, format_out->es->video.crop.y,
+           format_out->es->video.crop.width, format_out->es->video.crop.height);
+
+   getchar(); //Pause to display
+
+   /* The format of both ports is now set so we can get their buffer requirements and create
+    * our buffer headers. We use the buffer pool API to create these. */
+   encoder->input[0]->buffer_num = encoder->input[0]->buffer_num_min;
+   encoder->input[0]->buffer_size = encoder->input[0]->buffer_size_min;
+   encoder->output[0]->buffer_num = encoder->output[0]->buffer_num_min;
+   encoder->output[0]->buffer_size = encoder->output[0]->buffer_size_min;
+   pool_in = mmal_pool_create(encoder->input[0]->buffer_num,
+                              encoder->input[0]->buffer_size);
+   pool_out = mmal_pool_create(encoder->output[0]->buffer_num,
+                               encoder->output[0]->buffer_size);
+
+   /* Create a queue to store our decoded video frames. The callback we will get when
+    * a frame has been decoded will put the frame into this queue. */
+   context.queue = mmal_queue_create();
+
+   /* Store a reference to our context in each port (will be used during callbacks) */
+   encoder->input[0]->userdata = (MMAL_PORT_USERDATA_T *)&context;
+   encoder->output[0]->userdata = (MMAL_PORT_USERDATA_T *)&context;
+
+   // Enable all the input port and the output port.
+   if ( mmal_port_enable(encoder->input[0], input_callback) != MMAL_SUCCESS )
+     fprintf(stderr, "failed to enable mmal input port");
+   if ( mmal_port_enable(encoder->output[0], output_callback) != MMAL_SUCCESS )
+     fprintf(stderr, "failed to enable mmal output port");
+
+   /* Component won't start processing data until it is enabled. */
+   if ( mmal_component_enable(encoder) != MMAL_SUCCESS )
+     fprintf(stderr, "failed to enable mmal encoder component");
+
+
+}
 void streamocv(boost::circular_buffer<ring_buffer> &scb) {
     //USES less memory but no scaling
     
     usleep(5000000); //Let's wait for scb to populate
     int scb_size=scb.size();
     uint8_t *rbuff=nullptr;
-    AVFrameSideData* mbuff;
-    std::vector<cv::Point> vert_points;
+    uint8_t *mbuff=nullptr;
+    //std::vector<cv::Point> vert_points;
     
     //minimum manhattan distance to consider a motion_vector with displacement
     int min_vector_size=1; //FIXME, need to be a config option
@@ -398,39 +614,18 @@ void streamocv(boost::circular_buffer<ring_buffer> &scb) {
          if ((scb[0].buf_data) && (scb[0].mv_data)) {
            rbuff=scb[0].buf_data; //avoid a race condition, scb[0] might get updated by main thread while we are processing buf_data
            scb[0].buf_data=nullptr; // so take ownership
-           mbuff=(AVFrameSideData *)scb[0].mv_data;
+           mbuff=scb[0].mv_data;
            scb[0].mv_data=nullptr;
           
          }
         } //end scope
         
-        if ((mbuff->data) && (rbuff)){
-            int mvcount;
-               AVMotionVector *mv = (AVMotionVector*)mbuff->data;
-               mvcount = mbuff->size / sizeof(AVMotionVector);
-               std::vector<AVMotionVector> mvlistv=std::vector<AVMotionVector>(mv,mv+mvcount);
-            
-               vec_count=0;
-               if (mvlistv.size() > 0) {
-               for (auto mv : mvlistv) {
+        if ((mbuff) && (rbuff)){
+               
+               motion_vector_group *mgroup=(motion_vector_group*)mbuff;
+               //memcpy(mgroup,mbuff,sizeof(motion_vector_group));
+               vec_count=mgroup->size;
               
-                  //Check if different source and dest 
-                  if ((mv.src_x == mv.dst_x) && (mv.src_y == mv.dst_y))
-                      continue;
-                  
-                  //Check if vector had significant value
-                  //float power=2;
-                  //int magnitude=(int) sqrt (  std::pow( (mv.dst_x-mv.src_x) ,power) + std::pow( (mv.dst_y-mv.src_y) ,power)   )  ;
-                  //Use manhattan distance to avoid expensive sqrt and pow functions
-                  int magnitude = abs(mv.dst_x-mv.src_x) + abs(mv.dst_y-mv.src_y);
-                  if (magnitude < min_vector_size)
-                      continue;
-                  
-                  vec_count++; 
-                  vert_points.push_back(cv::Point(mv.dst_x,mv.dst_y));
-                
-               }
-               }
             
            cv::Mat mYUV(dec_ctx->height + dec_ctx->height/2, dec_ctx->width, CV_8UC1, (void*) rbuff);
            cv::cvtColor(mYUV, mRGB, CV_YUV2RGB_YV12,3); 
@@ -442,35 +637,38 @@ void streamocv(boost::circular_buffer<ring_buffer> &scb) {
                    cv::circle( mRGB, coords[i], 5.0, cv::Scalar( 0, 255, 0 ), 5, 8 ); 
                    cv::putText(mRGB, "Single Left CLick to add polygon vertex, close by clicking first vertex", cv::Point(100,100), cv::FONT_HERSHEY_PLAIN, 1,  cv::Scalar(0,0,255,255));
                  }
-               }    
+               } 
+               cv::imshow("Video", mRGB);
+               cv::waitKey(1);
            } else { 
                cv::putText(mRGB, "Double Right CLick inside polygon to delete Polygon", cv::Point(100,100), cv::FONT_HERSHEY_PLAIN, 1,  cv::Scalar(0,0,255,255));
                if (coords.size()>2)
                    cv::polylines(mRGB, coords, true, cv::Scalar( 110, 220, 0 ),  2, 8);
-                   
+               cv::imshow("Video", mRGB);
+               cv::waitKey(1);    
            }
          
           
-           if (vert_points.size() > 0) {
-                  for (auto j: vert_points) {
+           if (mgroup->mvect.size() > 0) {
+                  for (auto j: mgroup->mvect) {
                     if (polygon_complete) {  //polygon zone established
-                      if (pnpoly(coords.size(), coords, j)) {//vector is inside the zone
-                           auto it = std::partition(vert_points.begin(), vert_points.end(), [j,min_vector_cluster_distance](cv::Point i){ return ( (abs(j.x - i.x) + abs(j.y -i.y)) < min_vector_cluster_distance ); });
-                           if ((it-vert_points.begin()) > min_vectors_filter) //vector is close to other vectors
-                             cv::circle( mRGB, j, 5.0, cv::Scalar( 0, 0, 255 ), 5, 8 );
+                      if (pnpoly(coords.size(), coords, cv::Point(j.xcoord,j.ycoord))) {//vector is inside the zone
+                          // auto it = std::partition(mgroup->mvect.begin(), mgroup->mvect.end(), [j,min_vector_cluster_distance](cv::Point i){ return ( (abs(j.xcoord - i.x) + abs(j.ycoord -i.y)) < min_vector_cluster_distance ); });
+                          // if ((it-mgroup->mvect.begin()) > min_vectors_filter) //vector is close to other vectors
+                             cv::circle( mRGB, cv::Point(j.xcoord, j.ycoord), 5.0, cv::Scalar( 0, 0, 255 ), 5, 8 );
                       }  
                     }
                   }
-                  vert_points.clear();
+                  //vert_points.clear();
+                  cv::imshow("Video", mRGB);
+                  cv::waitKey(1);
            }
-           cv::imshow("Video", mRGB);
-           cv::waitKey(1);
            
            
            
            free(rbuff); //we owned this, so we need to free it
            rbuff=nullptr;
-            
+          
         }
         if (quitkey) {
             std::cout << "Quit" << std::endl;
@@ -554,11 +752,12 @@ int main(int argc, char **argv)
     int ret = 0;
     AVPacket pkt = { 0 };
 
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s rtsp://<user>:<pass>@url\n", argv[0]);
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <x264|mmal> rtsp://<user>:<pass>@url\n", argv[0]);
         exit(1);
     }
-    src_filename = argv[1];
+    src_filename = argv[2];
+    src_codec = argv[1];
     avformat_network_init();
     
 
@@ -575,6 +774,7 @@ int main(int argc, char **argv)
     }
 
     open_codec_context(fmt_ctx, AVMEDIA_TYPE_VIDEO);
+    open_mmal_context(video_dec_ctx);
     
     cv::namedWindow("Video", 1);
     cv::setMouseCallback("Video", CallBackFunc, NULL);
@@ -600,7 +800,6 @@ int main(int argc, char **argv)
     std::thread t_stream(streamocv, std::ref(cb));    
    
     
-    //while (true) {
     /* read frames from the file */
     while (av_read_frame(fmt_ctx, &pkt) >= 0) {
         if (pkt.stream_index == video_stream_idx) {
@@ -618,7 +817,6 @@ int main(int argc, char **argv)
         if (quitkey)
             break;
     }
-    //}
     
     
    //join the streaming thread 
@@ -626,11 +824,21 @@ int main(int argc, char **argv)
     }
     
     
+    
+    
     /* flush cached frames */
     avcodec_flush_buffers(dec_ctx);
+    avformat_network_deinit();
+    
+    if (quitkey)
+        goto end;
 end:
     avcodec_free_context(&video_dec_ctx);
     avformat_close_input(&fmt_ctx);
     av_frame_free(&frame);
-    return ret < 0;
+    avformat_network_deinit();
+    if (!quitkey)
+      return ret < 0;
+    else
+      return 0;
 }
