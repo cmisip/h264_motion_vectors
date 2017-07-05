@@ -137,7 +137,7 @@ public:
     }
     
     ~ring_buffer(){
-       // std::cout << "Destructor" << std::endl;
+        //std::cout << "Destructor" << std::endl;
         if (buf_data) {
        //     std::cout << "Freeing data" << std::endl;
             free(buf_data);
@@ -293,9 +293,9 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **buffer,
                 //std::cout << memcmp(*mvect,sd,sizeof(AVFrameSideData)) << std::endl;
                 
             }
-             else
+             else 
                 *mvect=nullptr;
-  
+             
             //Save the pict type
             Pict_type=frame->pict_type;
             
@@ -462,9 +462,10 @@ void streamocv(boost::circular_buffer<ring_buffer> &scb) {
                     }
                   }
                   vert_points.clear();
+                  cv::imshow("Video", mRGB);
+                  cv::waitKey(1);
            }
-           cv::imshow("Video", mRGB);
-           cv::waitKey(1);
+           
            
            
            
@@ -628,6 +629,7 @@ int main(int argc, char **argv)
     
     /* flush cached frames */
     avcodec_flush_buffers(dec_ctx);
+    avformat_network_deinit();
 end:
     avcodec_free_context(&video_dec_ctx);
     avformat_close_input(&fmt_ctx);
