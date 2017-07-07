@@ -43,7 +43,9 @@ extern "C" {
 #include "libswscale/swscale.h"
 #include "interface/mmal/mmal.h"
 #include "interface/mmal/util/mmal_default_components.h"
+#include "interface/mmal/util/mmal_util_params.h"
 #include "interface/vcos/vcos.h"
+#include <math.h>
 }
 
 #include <boost/circular_buffer.hpp>
@@ -77,10 +79,16 @@ std::mutex cb_mutex;
 std::vector<cv::Point> coords;
 bool quitkey=false;
 
+bool received=false;
+
 enum decode_options {
     x264,
     mmal
 } decode_mode;
+
+ //MMAL_STATUS_T status = MMAL_EINVAL;
+ MMAL_COMPONENT_T *encoder = 0;
+ MMAL_POOL_T *pool_in = 0, *pool_out = 0;
 
 struct motion_vector {
     char x_vector;
@@ -92,9 +100,10 @@ struct motion_vector {
     unsigned short sad;
 };
 
-struct motion_vector_group {
-    std::vector<motion_vector> mvect;
-    uint16_t size;
+struct mmal_motion_vector {
+    char x_vector;
+    char y_vector; 
+    short sad;
 };
 
 
@@ -109,13 +118,12 @@ static struct CONTEXT_T {
 static void input_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer) {
    struct CONTEXT_T *ctx = (struct CONTEXT_T *)port->userdata;
    mmal_buffer_header_release(buffer);
-   vcos_semaphore_post(&ctx->semaphore);
 }
 
 static void output_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer) {
    struct CONTEXT_T *ctx = (struct CONTEXT_T *)port->userdata;
    mmal_queue_put(ctx->queue, buffer);
-   vcos_semaphore_post(&ctx->semaphore);
+   //received=false;
 }
 
 
@@ -317,10 +325,10 @@ static void SaveFrame(AVFrame *pFrame, int width, int height, int iFrame)
     fclose(pFile);
 }
 
-static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **buffer, AVPictureType &Pict_type) {
+static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **vbuffer, AVPictureType &Pict_type) {
     //if (video_frame_count > 10)
     //        return -1;
-    //std::cout << "FRAME " << video_frame_count++ << std::endl;
+   //std::cout << "FRAME " << video_frame_count++ << std::endl;
     
     int framecomplete=false;
     int ret;
@@ -344,20 +352,51 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **buffer,
     }    
         
     if (framecomplete) {
-        if (decode_mode == x264) {
+            video_frame_count++;
+        
+        //Load buffer with the image
+            //Save the pict type
+            Pict_type=frame->pict_type;
             
-          if (frame->buf[0]) {  //REALLY IMPORTANT, otherwise bad frames sent to circular buffer results segfaults
+            //SAVE the frame buffer to buffer in its default pixelformat
+            int bufsize=av_image_get_buffer_size(AV_PIX_FMT_YUV420P, frame->width, frame->height, 1);
+            *vbuffer = (uint8_t *) malloc(bufsize);
+            memset(*vbuffer,0,bufsize);
+            int ret;
+            if (*vbuffer) {
+              ret=av_image_copy_to_buffer(*vbuffer, bufsize, (const uint8_t **)frame->data, frame->linesize,
+                                 AV_PIX_FMT_YUV420P, frame->width, frame->height, 1);
+              if (ret<0)
+                  return ret;
+            }
+            else {
+                *vbuffer=nullptr;
+                return -1;
+            }
+            
+        
+        //Extract motion vectors
+            
+        uint16_t mvect_size=(((video_dec_ctx->width*video_dec_ctx->height)/16)*4)+2;
+                
+            
+        if (frame->buf[0]) {  
+          if (decode_mode == x264) {
             int i;
             AVFrameSideData *sd;
 
-            //video_frame_count++;
+            
             sd = av_frame_get_side_data(frame, AV_FRAME_DATA_MOTION_VECTORS);
             if (sd) {
                 
-                motion_vector_group mgroup;
-                mgroup.size=sd->size / sizeof(AVMotionVector);
+                uint16_t size=sd->size / sizeof(AVMotionVector);
+                *mvect = (uint8_t *) malloc(mvect_size);
+                memset(*mvect,0,mvect_size);
+                memcpy(*mvect, &size, 2);
+                int offset=2;
                 const AVMotionVector *mvs = (const AVMotionVector *)sd->data;
-                    for (i = 0; i < sd->size / sizeof(*mvs); i++) {
+                int vect_size=0;
+                for (i = 0; i < sd->size / sizeof(*mvs); i++) {
                         const AVMotionVector *mv = &mvs[i];
                         motion_vector mvt;
                         mvt.height = mv->h;
@@ -368,6 +407,7 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **buffer,
                         mvt.x_vector = mv->src_x - mv->dst_x;
                         mvt.y_vector = mv->src_y - mv->dst_y;
                         
+                       /* move all these to analysis side
                         //Exclude motion vectors with zero x_vector and y_vector (did not move)
                         if ((mvt.x_vector == 0) && (mvt.y_vector == 0))
                             continue;
@@ -384,45 +424,123 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **buffer,
                         
                         if (mvt.ycoord > video_dec_ctx->height)
                             continue;
+                        */
                         
                         
-                        mgroup.mvect.push_back(mvt);
-                    }
-                 *mvect = (uint8_t *) malloc(sizeof(mgroup));
-                 memcpy(*mvect,&mgroup,sizeof(mgroup));
-                 
+                        memcpy(*mvect+offset,&mvt,sizeof(motion_vector));
+                        offset+=sizeof(motion_vector);
+                        
+                }
+                
             }
              else
                 *mvect=nullptr;
-  
-            //Save the pict type
-            Pict_type=frame->pict_type;
-            
-            //SAVE the frame buffer to buffer in its default pixelformat
-            int bufsize=av_image_get_buffer_size(AV_PIX_FMT_YUV420P, frame->width, frame->height, 1);
-            *buffer = (uint8_t *) malloc(bufsize);
-            memset(*buffer,0,bufsize);
-            int ret;
-            if (*buffer)
-              ret=av_image_copy_to_buffer(*buffer, bufsize, (const uint8_t **)frame->data, frame->linesize,
-                                AV_PIX_FMT_YUV420P, frame->width, frame->height, 1);
-            else {
-                *buffer=nullptr;
-                return -1;
             }
+          
+            if (decode_mode == mmal) {
+                MMAL_BUFFER_HEADER_T *buffer;
+                
+                //send free buffer to encoder
+                if ((buffer = mmal_queue_get(pool_out->queue)) != NULL) {
+                   if (mmal_port_send_buffer(encoder->output[0], buffer) != MMAL_SUCCESS) {
+                      fprintf(stderr, "failed to send buffer");
+                      return -1;
+                   }
+                } 
+                
+                //send buffer with yuv420 data to encoder
+                if ((buffer = mmal_queue_get(pool_in->queue)) != NULL)  {
+                   mmal_buffer_header_mem_lock(buffer);
+                   if ((*vbuffer) && (buffer->data)) {
+                       memcpy(buffer->data,*vbuffer,bufsize);  //copy frame->data to buffer->data
+                       *vbuffer=nullptr;
+                       buffer->length=bufsize;
+                   } 
+                  mmal_buffer_header_mem_unlock(buffer);
+                  
+                  int64_t current_time = vcos_getmicrosecs64()/1000;
+                  buffer->offset = 0; buffer->pts = buffer->dts = current_time;
+           
+                  fprintf(stderr, "sending %i bytes for frame number %d\n", (int)buffer->length, video_frame_count);
+                  if (mmal_port_send_buffer(encoder->input[0], buffer) != MMAL_SUCCESS) {
+                       fprintf(stderr, "failed to send buffer");
+                       return -1;
+                  }
+                } 
+                
+                received=false;
+                while (!received) {
+                
+                while ((buffer = mmal_queue_get(context.queue)) != NULL) {
+                    fprintf(stderr, "decoded frame\n");
+                    fprintf(stderr, "receiving %i bytes\n", (int)buffer->length);
+                    if(buffer->flags & MMAL_BUFFER_HEADER_FLAG_CONFIG) {
+                        printf("HEADER bytes \n");
+                    }
+                    else if(buffer->flags & MMAL_BUFFER_HEADER_FLAG_CODECSIDEINFO) {
+                        printf("SIDEDATA for frame number %d\n", video_frame_count);
+                        
+                        mmal_buffer_header_mem_lock(buffer);
+                        uint16_t size=buffer->length/4;
+                        struct mmal_motion_vector mvarray[size];
+                        
+                        //copy buffer->data to temporary
+                        memcpy(mvarray,buffer->data,buffer->length);
+                        mmal_buffer_header_mem_unlock(buffer);
+                        
+                        
+                        *mvect = (uint8_t *) malloc(mvect_size);
+                        memset(*mvect,0,mvect_size);
+                        memcpy(*mvect, &size, 2);
+                        int offset=2;
+                        
+                        for (int i=0;i < size ; i++) {
+                            motion_vector mvt;
+                            mvt.height = 16;
+                            mvt.width = 16;
+                            mvt.xcoord = (i*16) % (video_dec_ctx->width + 16);
+                            mvt.ycoord = ((i*16)/(video_dec_ctx->width+16))*16;
+                            mvt.sad = mvarray[i].sad;
+                            mvt.x_vector = mvarray[i].x_vector;
+                            mvt.y_vector = mvarray[i].y_vector;
+                            
+                            memcpy(*mvect+offset,&mvt,sizeof(motion_vector));
+                            offset+=sizeof(motion_vector);
+                         } 
+
+                        
+                    } else {
+                           printf("DATA\n");
+                    } 
+                    
+                    mmal_buffer_header_release(buffer);
+                   
+                    
+                } 
+                if (mmal_queue_length(context.queue) == 0 ) 
+                         received=true;
+                }    
+                
+                
+            }
+            
+          
+            }  else
+              std::cout << "Invalid frame received" << std::endl;
+        
+           
+  
             
             if (ret<0)
                 return ret;
-          } else
-              std::cout << "Invalid frame received" << std::endl;
           
-            av_frame_unref(frame);
-        } //if x264
+          
+            //av_frame_unref(frame);
         
-        if (decode_mode == mmal) {
-            printf("MMAL");
-        }
-    }    //if framecomplete
+        
+      
+    }  else
+        return -1; //if not framecomplete
     return 0;
     }
 
@@ -462,16 +580,16 @@ static int open_codec_context(AVFormatContext *fmt_ctx, enum AVMediaType type)
         dec_ctx->pix_fmt=AV_PIX_FMT_YUV420P;
 
         /* Init the video decoder */
-        if (strcmp(src_codec, "x264") == 0) {
-            decode_mode=::decode_options::x264;
+        //if (strcmp(src_codec, "x264") == 0) {
+        if (decode_mode == x264) {
           if ((dec = avcodec_find_decoder(st->codecpar->codec_id)) == NULL) {
               fprintf(stderr, "Failed to find hardware codec mmal");
               return ret;
           }    
           av_dict_set(&opts, "flags2", "+export_mvs", 0);
         }
-        if (strcmp(src_codec, "mmal") == 0) { 
-            decode_mode=::decode_options::mmal;
+        
+        if (decode_mode == mmal) {
           if ( (dec = avcodec_find_decoder_by_name("h264_mmal")) == NULL )  {
               fprintf(stderr, "Failed to find hardware codec mmal");    
               return ret;
@@ -491,10 +609,7 @@ static int open_codec_context(AVFormatContext *fmt_ctx, enum AVMediaType type)
 }
 
 static int open_mmal_context(AVCodecContext *video_dec_ctx){  //video_dec_ctx is global, just reminds that this depends on open_codec_context
-   MMAL_COMPONENT_T *encoder = 0;
-   MMAL_POOL_T *pool_in = 0, *pool_out = 0;
    
-
    vcos_semaphore_create(&context.semaphore, "example", 1);
 
    // Create the encoder component.
@@ -515,6 +630,7 @@ static int open_mmal_context(AVCodecContext *video_dec_ctx){  //video_dec_ctx is
    format_in->es->video.crop.height = video_dec_ctx->height;
  
 
+   
    if ( mmal_port_format_commit(encoder->input[0]) != MMAL_SUCCESS )
       fprintf(stderr, "failed to commit mmal encoder input format");
 
@@ -531,6 +647,9 @@ static int open_mmal_context(AVCodecContext *video_dec_ctx){  //video_dec_ctx is
    
    if ( mmal_port_format_commit(encoder->output[0]) != MMAL_SUCCESS )
      fprintf(stderr, "failed to commit output format");
+   
+   if (mmal_port_parameter_set_boolean(encoder->output[0], MMAL_PARAMETER_VIDEO_ENCODE_INLINE_VECTORS, 1) != MMAL_SUCCESS)
+      fprintf(stderr, "failed to request inline motion vectors from mmal encoder");
 
    /* Display the input port format */
    fprintf(stderr, "INPUT FORMAT \n");
@@ -556,7 +675,6 @@ static int open_mmal_context(AVCodecContext *video_dec_ctx){  //video_dec_ctx is
            format_out->es->video.crop.x, format_out->es->video.crop.y,
            format_out->es->video.crop.width, format_out->es->video.crop.height);
 
-   getchar(); //Pause to display
 
    /* The format of both ports is now set so we can get their buffer requirements and create
     * our buffer headers. We use the buffer pool API to create these. */
@@ -596,7 +714,6 @@ void streamocv(boost::circular_buffer<ring_buffer> &scb) {
     int scb_size=scb.size();
     uint8_t *rbuff=nullptr;
     uint8_t *mbuff=nullptr;
-    //std::vector<cv::Point> vert_points;
     
     //minimum manhattan distance to consider a motion_vector with displacement
     int min_vector_size=1; //FIXME, need to be a config option
@@ -620,11 +737,20 @@ void streamocv(boost::circular_buffer<ring_buffer> &scb) {
          }
         } //end scope
         
-        if ((mbuff) && (rbuff)){
+        if (decode_mode == mmal) {
+            //FIXME, build the mmal motion_vector group here and copy it to mbuff; rbuff contains the picture data  
+            continue;  //for now
+            
+        } 
+        
+        if ((mbuff) && (rbuff)){  
                
-               motion_vector_group *mgroup=(motion_vector_group*)mbuff;
-               //memcpy(mgroup,mbuff,sizeof(motion_vector_group));
-               vec_count=mgroup->size;
+            //   motion_vector_group *mgroup=(motion_vector_group*)mbuff;
+            //   vec_count=mgroup->size;
+            
+            uint16_t size;
+            memcpy(&size,mbuff,2);
+            // std::cout << "SS " << size << std::endl;
               
             
            cv::Mat mYUV(dec_ctx->height + dec_ctx->height/2, dec_ctx->width, CV_8UC1, (void*) rbuff);
@@ -649,7 +775,8 @@ void streamocv(boost::circular_buffer<ring_buffer> &scb) {
            }
          
           
-           if (mgroup->mvect.size() > 0) {
+           //FIXME
+          /* if (mgroup->mvect.size() > 0) {
                   for (auto j: mgroup->mvect) {
                     if (polygon_complete) {  //polygon zone established
                       if (pnpoly(coords.size(), coords, cv::Point(j.xcoord,j.ycoord))) {//vector is inside the zone
@@ -663,7 +790,7 @@ void streamocv(boost::circular_buffer<ring_buffer> &scb) {
                   cv::imshow("Video", mRGB);
                   cv::waitKey(1);
            }
-           
+           */
            
            
            free(rbuff); //we owned this, so we need to free it
@@ -760,7 +887,13 @@ int main(int argc, char **argv)
     src_codec = argv[1];
     avformat_network_init();
     
-
+    if (strcmp(src_codec, "x264") == 0) {
+       decode_mode=::decode_options::x264; 
+    }
+    if (strcmp(src_codec, "mmal") == 0) { 
+       decode_mode=::decode_options::mmal;
+    }
+    
     av_register_all();
 
     if (avformat_open_input(&fmt_ctx, src_filename, NULL, NULL) < 0) {
@@ -774,11 +907,13 @@ int main(int argc, char **argv)
     }
 
     open_codec_context(fmt_ctx, AVMEDIA_TYPE_VIDEO);
-    open_mmal_context(video_dec_ctx);
+    if (decode_mode == mmal)
+       open_mmal_context(video_dec_ctx);
     
+   
     cv::namedWindow("Video", 1);
     cv::setMouseCallback("Video", CallBackFunc, NULL);
-    mRGB=cv::Mat(dec_ctx->height, dec_ctx->width, CV_8UC3);
+    mRGB=cv::Mat(video_dec_ctx->height, video_dec_ctx->width, CV_8UC3);
     
     av_dump_format(fmt_ctx, 0, src_filename, 0);
 
@@ -795,35 +930,47 @@ int main(int argc, char **argv)
         goto end;
     }
  
-    {
-    //Launch the streaming thread
-    std::thread t_stream(streamocv, std::ref(cb));    
-   
     
-    /* read frames from the file */
-    while (av_read_frame(fmt_ctx, &pkt) >= 0) {
+    
+    {  //bracket for end
+    //Launch the streaming thread
+    //std::thread t_stream(streamocv, std::ref(cb));    
+  
+    
+   // int bufsize=av_image_get_buffer_size(AV_PIX_FMT_YUV420P, video_dec_ctx->width, video_dec_ctx->height, 1);
+   // uint8_t * fbuffer=NULL;
+   // uint8_t * buffer_data_copy=NULL;
+   // fbuffer = (uint8_t *) malloc(bufsize);   
+    int video_frame=0;
+    
+    //LOOP
+    
+     while (av_read_frame(fmt_ctx, &pkt) >= 0) {
         if (pkt.stream_index == video_stream_idx) {
             ret = decode_packet(&pkt, &mvects, &buff, Pict_type);
             if (ret >= 0)
                 {
                   std::lock_guard<std::mutex> lock(cb_mutex);
                   if ((mvects) && (buff))  //only push if we have valid buffers
-                    cb.push_back(ring_buffer(mvects,buff,Pict_type));
+                    //cb.push_back(ring_buffer(mvects,buff,Pict_type));
+                      usleep(1000);
                 }  
         }    
         av_packet_unref(&pkt);
-        if (ret < 0)
-            break;
+        //if (ret < 0)
+        //    break;
         if (quitkey)
             break;
-    }
+     }
+        
     
+   
+    
+    //if (fbuffer)
+     //  free(fbuffer);
     
    //join the streaming thread 
-    t_stream.join();
-    }
-    
-    
+    //t_stream.join();
     
     
     /* flush cached frames */
@@ -832,6 +979,11 @@ int main(int argc, char **argv)
     
     if (quitkey)
         goto end;
+    
+    }  //bracket for end
+    
+    
+    
 end:
     avcodec_free_context(&video_dec_ctx);
     avformat_close_input(&fmt_ctx);
