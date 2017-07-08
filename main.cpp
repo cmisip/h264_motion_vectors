@@ -41,10 +41,12 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavformat/avformat.h>
 #include "libswscale/swscale.h"
+#ifdef __arm__
 #include "interface/mmal/mmal.h"
 #include "interface/mmal/util/mmal_default_components.h"
 #include "interface/mmal/util/mmal_util_params.h"
 #include "interface/vcos/vcos.h"
+#endif
 #include <math.h>
 }
 
@@ -86,9 +88,7 @@ enum decode_options {
     mmal
 } decode_mode;
 
- //MMAL_STATUS_T status = MMAL_EINVAL;
- MMAL_COMPONENT_T *encoder = 0;
- MMAL_POOL_T *pool_in = 0, *pool_out = 0;
+
 
 struct motion_vector {
     char x_vector;
@@ -106,13 +106,16 @@ struct mmal_motion_vector {
     short sad;
 };
 
-
+#ifdef  __arm__
+ MMAL_COMPONENT_T *encoder = 0;
+ MMAL_POOL_T *pool_in = 0, *pool_out = 0;
 
 /** mmal context */
 static struct CONTEXT_T {
    //VCOS_SEMAPHORE_T semaphore;
    MMAL_QUEUE_T *queue;
 } context;
+
 
 
 static void input_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer) {
@@ -125,6 +128,7 @@ static void output_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer) {
    mmal_queue_put(ctx->queue, buffer);
 }
 
+#endif
 
 class ring_buffer{
 public:
@@ -415,7 +419,7 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **vbuffer
              else
                 *mvect=nullptr;
             }
-          
+#ifdef __arm__          
             if (decode_mode == mmal) {
                 MMAL_BUFFER_HEADER_T *buffer;
                 MMAL_BUFFER_HEADER_T *fbuffer;
@@ -535,6 +539,7 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **vbuffer
                 
                 
             }
+#endif
             
           
             }  else
@@ -618,6 +623,7 @@ static int open_codec_context(AVFormatContext *fmt_ctx, enum AVMediaType type)
     return 0;
 }
 
+#ifdef __arm__
 static int open_mmal_context(AVCodecContext *video_dec_ctx){  //video_dec_ctx is global, just reminds that this depends on open_codec_context
    
 
@@ -732,6 +738,9 @@ static int open_mmal_context(AVCodecContext *video_dec_ctx){  //video_dec_ctx is
    return 0;
 
 }
+
+#endif
+
 void streamocv(boost::circular_buffer<ring_buffer> &scb) {
     //USES less memory but no scaling
     
@@ -934,7 +943,12 @@ int main(int argc, char **argv)
        decode_mode=::decode_options::x264; 
     }
     if (strcmp(src_codec, "mmal") == 0) { 
+#ifdef __arm__        
        decode_mode=::decode_options::mmal;
+#else
+       printf("MMAL only valid on rpi system\n");
+       goto end;
+#endif
     }
     
     av_register_all();
@@ -950,17 +964,18 @@ int main(int argc, char **argv)
     }
 
     open_codec_context(fmt_ctx, AVMEDIA_TYPE_VIDEO);
+#ifdef __arm__
     if (decode_mode == mmal) {
        int ret = open_mmal_context(video_dec_ctx);
        if (ret < 0 )
           goto end;
     }   
-        
+#endif        
     cv::namedWindow("Video", 1);
     cv::setMouseCallback("Video", CallBackFunc, NULL);
     mRGB=cv::Mat(video_dec_ctx->height, video_dec_ctx->width, CV_8UC3);
-    cv::imshow("Video", mRGB);
-    cv::waitKey(1); 
+    //cv::imshow("Video", mRGB);
+    //cv::waitKey(1); 
     
     av_dump_format(fmt_ctx, 0, src_filename, 0);
 
@@ -1024,6 +1039,7 @@ int main(int argc, char **argv)
     
     
 end:
+#ifdef __arm__
     /* Cleanup MMAL */
    if (encoder)
       mmal_component_destroy(encoder);
@@ -1033,7 +1049,8 @@ end:
       mmal_pool_destroy(pool_out);
    if (context.queue)
       mmal_queue_destroy(context.queue);
-     
+#endif 
+
     /* Cleanup FFMPEG */
     avcodec_free_context(&video_dec_ctx);
     avformat_close_input(&fmt_ctx);
