@@ -110,7 +110,7 @@ struct mmal_motion_vector {
 
 /** mmal context */
 static struct CONTEXT_T {
-   VCOS_SEMAPHORE_T semaphore;
+   //VCOS_SEMAPHORE_T semaphore;
    MMAL_QUEUE_T *queue;
 } context;
 
@@ -123,7 +123,6 @@ static void input_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer) {
 static void output_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer) {
    struct CONTEXT_T *ctx = (struct CONTEXT_T *)port->userdata;
    mmal_queue_put(ctx->queue, buffer);
-   //received=false;
 }
 
 
@@ -407,26 +406,6 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **vbuffer
                         mvt.x_vector = mv->src_x - mv->dst_x;
                         mvt.y_vector = mv->src_y - mv->dst_y;
                         
-                       /* move all these to analysis side
-                        //Exclude motion vectors with zero x_vector and y_vector (did not move)
-                        if ((mvt.x_vector == 0) && (mvt.y_vector == 0))
-                            continue;
-                        
-                        //Exclude motion vectors that are outside the frame
-                        if (mvt.xcoord < 0)
-                            continue;
-                        
-                        if (mvt.ycoord < 0)
-                            continue;
-                        
-                        if (mvt.xcoord > video_dec_ctx->width)
-                            continue;
-                        
-                        if (mvt.ycoord > video_dec_ctx->height)
-                            continue;
-                        */
-                        
-                        
                         memcpy(*mvect+offset,&mvt,sizeof(motion_vector));
                         offset+=sizeof(motion_vector);
                         
@@ -455,7 +434,6 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **vbuffer
                    mmal_buffer_header_mem_lock(buffer);
                    if ((*vbuffer) && (buffer->data)) {
                        memcpy(buffer->data,*vbuffer,bufsize);  //copy frame->data to buffer->data
-                       *vbuffer=nullptr;
                        buffer->length=bufsize;
                    } 
                   mmal_buffer_header_mem_unlock(buffer);
@@ -513,7 +491,6 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **vbuffer
                             memcpy(*mvect+offset,&mvt,sizeof(motion_vector));
                             offset+=sizeof(motion_vector);
                          } 
-                        //received=true;
                         
                         //Send flush buffer to port
                         if ((fbuffer = mmal_queue_get(pool_in->queue)) != NULL)  {
@@ -552,12 +529,8 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **vbuffer
                             printf("sending free buffer for frame number %d\n",video_frame_count);
                       } 
                    } 
-                    //printf("-");
-                    //usleep(1000);
                   } else
                       printf("NULL buffer");
-                  //printf(".");
-                  //usleep(1000);
                 }    
                 
                 
@@ -575,8 +548,6 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **vbuffer
           
           
             //av_frame_unref(frame);
-        
-        
       
     }  else
         return -1; //if not framecomplete
@@ -649,11 +620,12 @@ static int open_codec_context(AVFormatContext *fmt_ctx, enum AVMediaType type)
 
 static int open_mmal_context(AVCodecContext *video_dec_ctx){  //video_dec_ctx is global, just reminds that this depends on open_codec_context
    
-   vcos_semaphore_create(&context.semaphore, "example", 1);
 
    // Create the encoder component.
-   if ( mmal_component_create(MMAL_COMPONENT_DEFAULT_VIDEO_ENCODER, &encoder)  != MMAL_SUCCESS) 
+   if ( mmal_component_create(MMAL_COMPONENT_DEFAULT_VIDEO_ENCODER, &encoder)  != MMAL_SUCCESS) {
       fprintf(stderr,"failed to create mmal encoder");
+      return -1;
+   }   
 
    /* Set format of video encoder input port */
    MMAL_ES_FORMAT_T *format_in = encoder->input[0]->format;
@@ -670,8 +642,10 @@ static int open_mmal_context(AVCodecContext *video_dec_ctx){  //video_dec_ctx is
  
 
    
-   if ( mmal_port_format_commit(encoder->input[0]) != MMAL_SUCCESS )
+   if ( mmal_port_format_commit(encoder->input[0]) != MMAL_SUCCESS ) {
       fprintf(stderr, "failed to commit mmal encoder input format");
+      return -1;
+   }   
 
    MMAL_ES_FORMAT_T *format_out = encoder->output[0]->format;
    format_out->type = MMAL_ES_TYPE_VIDEO;
@@ -684,11 +658,15 @@ static int open_mmal_context(AVCodecContext *video_dec_ctx){  //video_dec_ctx is
    format_out->es->video.par.den = 1;
    
    
-   if ( mmal_port_format_commit(encoder->output[0]) != MMAL_SUCCESS )
+   if ( mmal_port_format_commit(encoder->output[0]) != MMAL_SUCCESS ) {
      fprintf(stderr, "failed to commit output format");
+     return -1; 
+   }
    
-   if (mmal_port_parameter_set_boolean(encoder->output[0], MMAL_PARAMETER_VIDEO_ENCODE_INLINE_VECTORS, 1) != MMAL_SUCCESS)
+   if (mmal_port_parameter_set_boolean(encoder->output[0], MMAL_PARAMETER_VIDEO_ENCODE_INLINE_VECTORS, 1) != MMAL_SUCCESS) {
       fprintf(stderr, "failed to request inline motion vectors from mmal encoder");
+      return -1;
+   }   
 
    /* Display the input port format */
    fprintf(stderr, "INPUT FORMAT \n");
@@ -733,17 +711,25 @@ static int open_mmal_context(AVCodecContext *video_dec_ctx){  //video_dec_ctx is
    /* Store a reference to our context in each port (will be used during callbacks) */
    encoder->input[0]->userdata = (MMAL_PORT_USERDATA_T *)&context;
    encoder->output[0]->userdata = (MMAL_PORT_USERDATA_T *)&context;
-
+   
    // Enable all the input port and the output port.
-   if ( mmal_port_enable(encoder->input[0], input_callback) != MMAL_SUCCESS )
+   if ( mmal_port_enable(encoder->input[0], input_callback) != MMAL_SUCCESS ) {
      fprintf(stderr, "failed to enable mmal input port");
-   if ( mmal_port_enable(encoder->output[0], output_callback) != MMAL_SUCCESS )
+     return -1;
+   }  
+   
+   if ( mmal_port_enable(encoder->output[0], output_callback) != MMAL_SUCCESS ) {
      fprintf(stderr, "failed to enable mmal output port");
-
+     return -1; 
+   }
+   
    /* Component won't start processing data until it is enabled. */
-   if ( mmal_component_enable(encoder) != MMAL_SUCCESS )
+   if ( mmal_component_enable(encoder) != MMAL_SUCCESS ) {
      fprintf(stderr, "failed to enable mmal encoder component");
+     return -1;
+   }  
 
+   return 0;
 
 }
 void streamocv(boost::circular_buffer<ring_buffer> &scb) {
@@ -776,20 +762,15 @@ void streamocv(boost::circular_buffer<ring_buffer> &scb) {
          }
         } //end scope
         
-        if (decode_mode == mmal) {
-            //FIXME, build the mmal motion_vector group here and copy it to mbuff; rbuff contains the picture data  
-            continue;  //for now
-            
-        } 
+        
         
         if ((mbuff) && (rbuff)){  
-               
-            //   motion_vector_group *mgroup=(motion_vector_group*)mbuff;
-            //   vec_count=mgroup->size;
-            
+           
             uint16_t size;
             memcpy(&size,mbuff,2);
-            // std::cout << "SS " << size << std::endl;
+            struct motion_vector mvarray[size];
+                        
+            memcpy(mvarray,mbuff+2,size*sizeof(motion_vector));
               
             
            cv::Mat mYUV(dec_ctx->height + dec_ctx->height/2, dec_ctx->width, CV_8UC1, (void*) rbuff);
@@ -813,23 +794,46 @@ void streamocv(boost::circular_buffer<ring_buffer> &scb) {
                cv::waitKey(1);    
            }
          
-          
-           //FIXME
-          /* if (mgroup->mvect.size() > 0) {
-                  for (auto j: mgroup->mvect) {
+        
+           
+           if (size > 0) {
+                  for (auto j: mvarray) {
                     if (polygon_complete) {  //polygon zone established
+                        //Exclude motion vectors with zero x_vector and y_vector (did not move)
+                        if ((j.x_vector == 0) && (j.y_vector == 0))
+                            continue;
+                        
+                        //Exclude motion vectors that are outside the frame
+                        if (j.xcoord < 0)
+                            continue;
+                        
+                        if (j.ycoord < 0)
+                            continue;
+                        
+                        if (j.xcoord > video_dec_ctx->width)
+                            continue;
+                        
+                        if (j.ycoord > video_dec_ctx->height)
+                            continue;
+                        
+                          
+                        
+                        
+                        
                       if (pnpoly(coords.size(), coords, cv::Point(j.xcoord,j.ycoord))) {//vector is inside the zone
                           // auto it = std::partition(mgroup->mvect.begin(), mgroup->mvect.end(), [j,min_vector_cluster_distance](cv::Point i){ return ( (abs(j.xcoord - i.x) + abs(j.ycoord -i.y)) < min_vector_cluster_distance ); });
                           // if ((it-mgroup->mvect.begin()) > min_vectors_filter) //vector is close to other vectors
                              cv::circle( mRGB, cv::Point(j.xcoord, j.ycoord), 5.0, cv::Scalar( 0, 0, 255 ), 5, 8 );
-                      }  
+                      } 
+                      
+                      
                     }
                   }
                   //vert_points.clear();
                   cv::imshow("Video", mRGB);
                   cv::waitKey(1);
            }
-           */
+           
            
            
            free(rbuff); //we owned this, so we need to free it
@@ -946,13 +950,17 @@ int main(int argc, char **argv)
     }
 
     open_codec_context(fmt_ctx, AVMEDIA_TYPE_VIDEO);
-    if (decode_mode == mmal)
-       open_mmal_context(video_dec_ctx);
-    
-   
+    if (decode_mode == mmal) {
+       int ret = open_mmal_context(video_dec_ctx);
+       if (ret < 0 )
+          goto end;
+    }   
+        
     cv::namedWindow("Video", 1);
     cv::setMouseCallback("Video", CallBackFunc, NULL);
     mRGB=cv::Mat(video_dec_ctx->height, video_dec_ctx->width, CV_8UC3);
+    cv::imshow("Video", mRGB);
+    cv::waitKey(1); 
     
     av_dump_format(fmt_ctx, 0, src_filename, 0);
 
@@ -973,7 +981,7 @@ int main(int argc, char **argv)
     
     {  //bracket for end
     //Launch the streaming thread
-    //std::thread t_stream(streamocv, std::ref(cb));    
+    std::thread t_stream(streamocv, std::ref(cb));    
   
     
    
@@ -988,8 +996,7 @@ int main(int argc, char **argv)
                 {
                   std::lock_guard<std::mutex> lock(cb_mutex);
                   if ((mvects) && (buff))  //only push if we have valid buffers
-                    //cb.push_back(ring_buffer(mvects,buff,Pict_type));
-                      usleep(1000);
+                      cb.push_back(ring_buffer(mvects,buff,Pict_type));
                 }  
         }    
         av_packet_unref(&pkt);
@@ -1001,26 +1008,34 @@ int main(int argc, char **argv)
         
     
    
-    
-    //if (fbuffer)
-     //  free(fbuffer);
-    
+  
    //join the streaming thread 
-    //t_stream.join();
+    t_stream.join();
     
     
     /* flush cached frames */
     avcodec_flush_buffers(dec_ctx);
     avformat_network_deinit();
     
-    if (quitkey)
-        goto end;
+    //if (quitkey)
+    goto end;
     
     }  //bracket for end
     
     
     
 end:
+    /* Cleanup MMAL */
+   if (encoder)
+      mmal_component_destroy(encoder);
+   if (pool_in)
+      mmal_pool_destroy(pool_in);
+   if (pool_out)
+      mmal_pool_destroy(pool_out);
+   if (context.queue)
+      mmal_queue_destroy(context.queue);
+     
+    /* Cleanup FFMPEG */
     avcodec_free_context(&video_dec_ctx);
     avformat_close_input(&fmt_ctx);
     av_frame_free(&frame);
