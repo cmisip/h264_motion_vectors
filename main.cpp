@@ -328,7 +328,6 @@ static void SaveFrame(AVFrame *pFrame, int width, int height, int iFrame)
 static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **vbuffer, AVPictureType &Pict_type) {
     //if (video_frame_count > 10)
     //        return -1;
-   //std::cout << "FRAME " << video_frame_count++ << std::endl;
     
     int framecomplete=false;
     int ret;
@@ -353,8 +352,10 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **vbuffer
         
     if (framecomplete) {
             video_frame_count++;
+            std::cout << "FRAME " << video_frame_count << "-----------------------------------------------------------------" <<std::endl;
+    
         
-        //Load buffer with the image
+            //Load buffer with the image
             //Save the pict type
             Pict_type=frame->pict_type;
             
@@ -376,7 +377,6 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **vbuffer
             
         
         //Extract motion vectors
-            
         uint16_t mvect_size=(((video_dec_ctx->width*video_dec_ctx->height)/16)*4)+2;
                 
             
@@ -439,9 +439,11 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **vbuffer
           
             if (decode_mode == mmal) {
                 MMAL_BUFFER_HEADER_T *buffer;
+                MMAL_BUFFER_HEADER_T *fbuffer;
                 
                 //send free buffer to encoder
                 if ((buffer = mmal_queue_get(pool_out->queue)) != NULL) {
+                   fprintf(stderr, "Sending free buffer to encoder output for frame number %d\n", video_frame_count);
                    if (mmal_port_send_buffer(encoder->output[0], buffer) != MMAL_SUCCESS) {
                       fprintf(stderr, "failed to send buffer");
                       return -1;
@@ -461,21 +463,25 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **vbuffer
                   int64_t current_time = vcos_getmicrosecs64()/1000;
                   buffer->offset = 0; buffer->pts = buffer->dts = current_time;
            
-                  fprintf(stderr, "sending %i bytes for frame number %d\n", (int)buffer->length, video_frame_count);
+                  fprintf(stderr, "sending %i YUV420 bytes for frame number %d\n", (int)buffer->length, video_frame_count);
                   if (mmal_port_send_buffer(encoder->input[0], buffer) != MMAL_SUCCESS) {
                        fprintf(stderr, "failed to send buffer");
                        return -1;
                   }
                 } 
                 
+                
                 received=false;
                 while (!received) {
                 
-                while ((buffer = mmal_queue_get(context.queue)) != NULL) {
+                 // if ((buffer = mmal_queue_get(context.queue)) != NULL) {
+                    if (buffer = mmal_queue_timedwait(context.queue, 100)) {
+                        
                     fprintf(stderr, "decoded frame\n");
-                    fprintf(stderr, "receiving %i bytes\n", (int)buffer->length);
+                    fprintf(stderr, "receiving %i bytes for frame number %d\n", (int)buffer->length, video_frame_count );
+                    
                     if(buffer->flags & MMAL_BUFFER_HEADER_FLAG_CONFIG) {
-                        printf("HEADER bytes \n");
+                        printf("HEADER bytes for frame number %d\n", video_frame_count);
                     }
                     else if(buffer->flags & MMAL_BUFFER_HEADER_FLAG_CODECSIDEINFO) {
                         printf("SIDEDATA for frame number %d\n", video_frame_count);
@@ -507,18 +513,51 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **vbuffer
                             memcpy(*mvect+offset,&mvt,sizeof(motion_vector));
                             offset+=sizeof(motion_vector);
                          } 
-
+                        //received=true;
                         
-                    } else {
-                           printf("DATA\n");
+                        //Send flush buffer to port
+                        if ((fbuffer = mmal_queue_get(pool_in->queue)) != NULL)  {
+                             mmal_buffer_header_mem_lock(fbuffer);
+                             fbuffer->flags = MMAL_BUFFER_HEADER_FLAG_EOS| MMAL_BUFFER_HEADER_FLAG_FRAME_END | MMAL_BUFFER_HEADER_FLAG_FRAME_START;
+                             fbuffer->length=0;
+                             mmal_buffer_header_mem_unlock(fbuffer);
+           
+                             fprintf(stderr, "sending %i flush bytes for frame number %d\n", (int)fbuffer->length, video_frame_count);
+                                 if (mmal_port_send_buffer(encoder->input[0], fbuffer) != MMAL_SUCCESS) {
+                                    fprintf(stderr, "failed to send flush buffer");
+                                    return -1;
+                                 } else
+                                    printf("Sent flush buffer for frame number %d\n", video_frame_count);
+                        }  else 
+                            printf("Failed to send flush buffer\n");
+                        
+                        
+                    } else if (buffer->flags & MMAL_BUFFER_HEADER_FLAG_EOS) {
+                        received=true;
+                        printf("****************************FLUSH BUFFER RESPONSE ***************************\n");
+                    }
+                    else {
+                           printf("DATA for frame number %d\n",video_frame_count);
                     } 
                     
                     mmal_buffer_header_release(buffer);
-                   
                     
-                } 
-                if (mmal_queue_length(context.queue) == 0 ) 
-                         received=true;
+                   //send free buffer to encoder if we have not received the flush response
+                   if (!received) {
+                      if ((buffer = mmal_queue_get(pool_out->queue)) != NULL) {
+                         if (mmal_port_send_buffer(encoder->output[0], buffer) != MMAL_SUCCESS) {
+                            fprintf(stderr, "failed to resend buffer");
+                            return -1;
+                         } else
+                            printf("sending free buffer for frame number %d\n",video_frame_count);
+                      } 
+                   } 
+                    //printf("-");
+                    //usleep(1000);
+                  } else
+                      printf("NULL buffer");
+                  //printf(".");
+                  //usleep(1000);
                 }    
                 
                 
@@ -937,10 +976,7 @@ int main(int argc, char **argv)
     //std::thread t_stream(streamocv, std::ref(cb));    
   
     
-   // int bufsize=av_image_get_buffer_size(AV_PIX_FMT_YUV420P, video_dec_ctx->width, video_dec_ctx->height, 1);
-   // uint8_t * fbuffer=NULL;
-   // uint8_t * buffer_data_copy=NULL;
-   // fbuffer = (uint8_t *) malloc(bufsize);   
+   
     int video_frame=0;
     
     //LOOP
