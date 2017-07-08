@@ -988,7 +988,6 @@ int main(int argc, char **argv)
     int video_frame=0;
     
     //LOOP
-    
      while (av_read_frame(fmt_ctx, &pkt) >= 0) {
         if (pkt.stream_index == video_stream_idx) {
             ret = decode_packet(&pkt, &mvects, &buff, Pict_type);
