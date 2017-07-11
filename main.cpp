@@ -442,8 +442,8 @@ static int decode_packet(const AVPacket *pkt, uint8_t **mvect, uint8_t **vbuffer
                    } 
                   mmal_buffer_header_mem_unlock(buffer);
                   
-                  int64_t current_time = vcos_getmicrosecs64()/1000;
-                  buffer->offset = 0; buffer->pts = buffer->dts = current_time;
+                  //int64_t current_time = vcos_getmicrosecs64()/1000;
+                  buffer->offset = 0; buffer->pts = buffer->dts = MMAL_TIME_UNKNOWN;
            
                   fprintf(stderr, "sending %i YUV420 bytes for frame number %d\n", (int)buffer->length, video_frame_count);
                   if (mmal_port_send_buffer(encoder->input[0], buffer) != MMAL_SUCCESS) {
